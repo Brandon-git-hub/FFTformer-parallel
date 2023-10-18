@@ -6,12 +6,13 @@ from torchvision.transforms import functional as F
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image as Image
 from tqdm import tqdm
+from torch import autocast
 
 
 class DeblurDataset(Dataset):
     def __init__(self, image_dir, transform=None, is_test=False):
         self.image_dir = image_dir
-        self.image_list = os.listdir(os.path.join(image_dir, 'input/'))
+        self.image_list = os.listdir(os.path.join(image_dir, 'blur/'))
         self._check_image(self.image_list)
         self.image_list.sort()
         self.transform = transform
@@ -21,8 +22,8 @@ class DeblurDataset(Dataset):
         return len(self.image_list)
 
     def __getitem__(self, idx):
-        image = Image.open(os.path.join(self.image_dir, 'input', self.image_list[idx]))
-        label = Image.open(os.path.join(self.image_dir, 'target', self.image_list[idx]))
+        image = Image.open(os.path.join(self.image_dir, 'blur', self.image_list[idx]))
+        label = Image.open(os.path.join(self.image_dir, 'sharp', self.image_list[idx]))
 
         if self.transform:
             image, label = self.transform(image, label)
@@ -66,55 +67,61 @@ def main(args):
 
     model = fftformer()
     # print(model)
-    if torch.cuda.is_available():
-        model.cuda()
+    # if torch.cuda.is_available():
+    #     model.cuda()
 
     _eval(model, args)
 
 def _eval(model, args):
     state_dict = torch.load(args.test_model)
     model.load_state_dict(state_dict,strict = True)
-    device = torch.device( 'cuda')
+    # model.half()
+    ##
+    device = torch.device('cuda')
+
     dataloader = test_dataloader(args.data_dir, batch_size=1, num_workers=0)
     torch.cuda.empty_cache()
-
+    
     model.eval()
-
+    precision_scope = autocast 
     with torch.no_grad():
+        with precision_scope("cuda"):
+            # Main Evaluation
+            for iter_idx, data in tqdm(enumerate(dataloader)):
+                input_img, label_img, name = data
 
-        # Main Evaluation
-        for iter_idx, data in tqdm(enumerate(dataloader)):
-            input_img, label_img, name = data
+                input_img = input_img.to(device)
 
-            input_img = input_img.to(device)
+                b, c, h, w = input_img.shape
+                h_n = (32 - h % 32) % 32
+                w_n = (32 - w % 32) % 32
+                input_img = torch.nn.functional.pad(input_img, (0, w_n, 0, h_n), mode='reflect')
+                # input_img = input_img.half()
+                print(input_img.dtype)
 
-            b, c, h, w = input_img.shape
-            h_n = (32 - h % 32) % 32
-            w_n = (32 - w % 32) % 32
-            input_img = torch.nn.functional.pad(input_img, (0, w_n, 0, h_n), mode='reflect')
+                print(f'Iteration:{iter_idx}')
+                pred = model(input_img)
+                torch.cuda.synchronize()
+                pred = pred[:, :, :h, :w]
 
-            pred = model(input_img)
-            torch.cuda.synchronize()
-            pred = pred[:, :, :h, :w]
-
-            pred_clip = torch.clamp(pred, 0, 1)
+                pred_clip = torch.clamp(pred, 0, 1)
 
 
-            if args.save_image:
-                save_name = os.path.join(args.result_dir, name[0])
-                pred_clip += 0.5 / 255
-                pred = F.to_pil_image(pred_clip.squeeze(0).cpu(), 'RGB')
-                pred.save(save_name)
+                if args.save_image:
+                    save_name = os.path.join(args.result_dir, name[0])
+                    pred_clip += 0.5 / 255
+                    pred = F.to_pil_image(pred_clip.squeeze(0).cpu(), 'RGB')
+                    pred.save(save_name)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     # Directories
     parser.add_argument('--model_name', default='fftformer', type=str)
-    parser.add_argument('--data_dir', type=str, default='/media/kls/新加卷1/CVPR_2023/GoPro_test/')
+    parser.add_argument('--data_dir', type=str, default='/media/user/VCLAB/dataset/GOPRO')
 
     # Test
-    parser.add_argument('--test_model', type=str, default='./pretrain_model/net_g_GoPro_HIDE.pth')
+    parser.add_argument('--test_model', type=str, default='./pretrain_model/fftformer_GoPro.pth')
     parser.add_argument('--save_image', type=bool, default=True, choices=[True, False])
 
     args = parser.parse_args()
