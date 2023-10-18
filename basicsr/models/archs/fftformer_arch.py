@@ -1,8 +1,12 @@
 import torch
 import torch.nn as nn
+from torch import Tensor, nn
 import torch.nn.functional as F
 import numbers
 from einops import rearrange
+
+from torchgpipe.skip import Namespace, pop, skippable, stash
+from collections import OrderedDict
 
 
 def to_3d(x):
@@ -12,6 +16,7 @@ def to_3d(x):
 def to_4d(x, h, w):
     return rearrange(x, 'b (h w) c -> b c h w', h=h, w=w)
 
+    
 
 class BiasFree_LayerNorm(nn.Module):
     def __init__(self, normalized_shape):
@@ -82,13 +87,16 @@ class DFFN(nn.Module):
 
     def forward(self, x):
         x = self.project_in(x)
+        print(x.dtype)
         x_patch = rearrange(x, 'b c (h patch1) (w patch2) -> b c h w patch1 patch2', patch1=self.patch_size,
                             patch2=self.patch_size)
+        ## It's you!!!!
         x_patch_fft = torch.fft.rfft2(x_patch.float())
         x_patch_fft = x_patch_fft * self.fft
         x_patch = torch.fft.irfft2(x_patch_fft, s=(self.patch_size, self.patch_size))
         x = rearrange(x_patch, 'b c h w patch1 patch2 -> b c (h patch1) (w patch2)', patch1=self.patch_size,
                       patch2=self.patch_size)
+        ##
         x1, x2 = self.dwconv(x).chunk(2, dim=1)
 
         x = F.gelu(x1) * x2
@@ -113,11 +121,13 @@ class FSAS(nn.Module):
         hidden = self.to_hidden(x)
 
         q, k, v = self.to_hidden_dw(hidden).chunk(3, dim=1)
+        print(q.dtype)
 
         q_patch = rearrange(q, 'b c (h patch1) (w patch2) -> b c h w patch1 patch2', patch1=self.patch_size,
                             patch2=self.patch_size)
         k_patch = rearrange(k, 'b c (h patch1) (w patch2) -> b c h w patch1 patch2', patch1=self.patch_size,
                             patch2=self.patch_size)
+        ### fuck!!!
         q_fft = torch.fft.rfft2(q_patch.float())
         k_fft = torch.fft.rfft2(k_patch.float())
 
@@ -129,6 +139,8 @@ class FSAS(nn.Module):
         out = self.norm(out)
 
         output = v * out
+        ## it's ok? No..
+        # .half()
         output = self.project_out(output)
 
         return output
@@ -156,6 +168,28 @@ class TransformerBlock(nn.Module):
         return x
 
 
+@skippable(stash=['cat'])
+class UpStash(nn.Module):
+    def forward(self, tensor: Tensor) -> Tensor:  # type: ignore
+        yield stash('cat', tensor)
+        return tensor
+
+@skippable(pop=['cat'])
+class UpCat(nn.Module):
+    def __init__(self, cat=True):
+        super().__init__()
+        self.cat = cat
+    def forward(self, input: Tensor) -> Tensor:  # type: ignore
+        identity = yield pop('cat')
+        
+        if self.cat:
+            output = torch.cat((input, identity), dim=1)
+        else:
+            output = input+identity
+        # print(output.shape)
+        return output
+    
+
 class Fuse(nn.Module):
     def __init__(self, n_feat):
         super(Fuse, self).__init__()
@@ -166,14 +200,31 @@ class Fuse(nn.Module):
         self.conv2 = nn.Conv2d(n_feat * 2, n_feat * 2, 1, 1, 0)
 
     def forward(self, enc, dnc):
+    # def forward(self, cated):
         x = self.conv(torch.cat((enc, dnc), dim=1))
+        # x = self.conv(cated)
         x = self.att_channel(x)
         x = self.conv2(x)
         e, d = torch.split(x, [self.n_feat, self.n_feat], dim=1)
         output = e + d
-
         return output
 
+
+# @skippable(stash=['identity'])
+# class Identity(nn.Module):
+#     def forward(self, tensor: Tensor) -> Tensor:  # type: ignore
+#         yield stash('identity', tensor)
+#         return tensor
+
+# @skippable(pop=['identity'])
+# class Residual(nn.Module):
+
+#     def __init__(self):
+#         super().__init__()
+
+#     def forward(self, input: Tensor) -> Tensor:  # type: ignore
+#         identity = yield pop('identity')
+#         return input + identity
 
 ##########################################################################
 ## Overlapped image patch embedding with 3x3 Conv
@@ -213,8 +264,15 @@ class Upsample(nn.Module):
         return self.body(x)
 
 
+
+
+
+
 ##########################################################################
 ##---------- FFTformer -----------------------
+
+
+
 class fftformer(nn.Module):
     def __init__(self,
                  inp_channels=3,
@@ -227,71 +285,206 @@ class fftformer(nn.Module):
                  ):
         super(fftformer, self).__init__()
 
-        self.patch_embed = OverlapPatchEmbed(inp_channels, dim)
+        self.patch_embed = OverlapPatchEmbed(inp_channels, dim).to('cuda:0')
 
         self.encoder_level1 = nn.Sequential(*[
             TransformerBlock(dim=dim, ffn_expansion_factor=ffn_expansion_factor, bias=bias) for i in
-            range(num_blocks[0])])
+            range(num_blocks[0])]).to('cuda:0')
 
-        self.down1_2 = Downsample(dim)
+        self.down1_2 = Downsample(dim).to('cuda:0')
         self.encoder_level2 = nn.Sequential(*[
             TransformerBlock(dim=int(dim * 2 ** 1), ffn_expansion_factor=ffn_expansion_factor,
-                             bias=bias) for i in range(num_blocks[1])])
+                             bias=bias) for i in range(num_blocks[1])]).to('cuda:0')
 
-        self.down2_3 = Downsample(int(dim * 2 ** 1))
+        self.down2_3 = Downsample(int(dim * 2 ** 1)).to('cuda:0')
         self.encoder_level3 = nn.Sequential(*[
             TransformerBlock(dim=int(dim * 2 ** 2), ffn_expansion_factor=ffn_expansion_factor,
-                             bias=bias) for i in range(num_blocks[2])])
-
+                             bias=bias) for i in range(num_blocks[2])]).to('cuda:0')
+        
         self.decoder_level3 = nn.Sequential(*[
             TransformerBlock(dim=int(dim * 2 ** 2), ffn_expansion_factor=ffn_expansion_factor,
-                             bias=bias, att=True) for i in range(num_blocks[2])])
-
-        self.up3_2 = Upsample(int(dim * 2 ** 2))
-        self.reduce_chan_level2 = nn.Conv2d(int(dim * 2 ** 2), int(dim * 2 ** 1), kernel_size=1, bias=bias)
+                             bias=bias, att=True) for i in range(num_blocks[2])]).to('cuda:0')
+        
+        self.up3_2 = Upsample(int(dim * 2 ** 2)).to('cuda:0')
+        self.fuse2 = Fuse(dim * 2).to('cuda:0')
+        
+        self.reduce_chan_level2 = nn.Conv2d(int(dim * 2 ** 2), int(dim * 2 ** 1), kernel_size=1, bias=bias).to('cuda:0')
+        
         self.decoder_level2 = nn.Sequential(*[
             TransformerBlock(dim=int(dim * 2 ** 1), ffn_expansion_factor=ffn_expansion_factor,
-                             bias=bias, att=True) for i in range(num_blocks[1])])
-
-        self.up2_1 = Upsample(int(dim * 2 ** 1))
-
+                             bias=bias, att=True) for i in range(num_blocks[1])]).to('cuda:0')
+        
+        self.up2_1 = Upsample(int(dim * 2 ** 1)).to('cuda:0')
+        # ===================================================================================
+        self.fuse1 = Fuse(dim).to('cuda:1')
+        
         self.decoder_level1 = nn.Sequential(*[
             TransformerBlock(dim=int(dim), ffn_expansion_factor=ffn_expansion_factor,
-                             bias=bias, att=True) for i in range(num_blocks[0])])
-
+                             bias=bias, att=True) for i in range(num_blocks[0])]).to('cuda:1')
+        
         self.refinement = nn.Sequential(*[
             TransformerBlock(dim=int(dim), ffn_expansion_factor=ffn_expansion_factor,
-                             bias=bias, att=True) for i in range(num_refinement_blocks)])
+                             bias=bias, att=True) for i in range(num_refinement_blocks)]).to('cuda:1')
 
-        self.fuse2 = Fuse(dim * 2)
-        self.fuse1 = Fuse(dim)
-        self.output = nn.Conv2d(int(dim), out_channels, kernel_size=3, stride=1, padding=1, bias=bias)
+        
+        self.output = nn.Conv2d(int(dim), out_channels, kernel_size=3, stride=1, padding=1, bias=bias).to('cuda:1')
 
     def forward(self, inp_img):
+        # self.patch_embed = self.patch_embed.to('cuda:0')
         inp_enc_level1 = self.patch_embed(inp_img)
+
+        # self.encoder_level1 = self.encoder_level1.to('cuda:0')
         out_enc_level1 = self.encoder_level1(inp_enc_level1)
+        del inp_enc_level1
 
+        # self.down1_2 = self.down1_2.to('cuda:0')
         inp_enc_level2 = self.down1_2(out_enc_level1)
+        # self.encoder_level2 = self.encoder_level2.to('cuda:0')
         out_enc_level2 = self.encoder_level2(inp_enc_level2)
+        del inp_enc_level2
 
+        # self.down2_3 = self.down2_3.to('cuda:0')
         inp_enc_level3 = self.down2_3(out_enc_level2)
+        # self.encoder_level3 = self.encoder_level3.to('cuda:0')
         out_enc_level3 = self.encoder_level3(inp_enc_level3)
+        del inp_enc_level3
 
+        # self.decoder_level3 = self.decoder_level3.to('cuda:1')
+        # self.decoder_level3 = self.decoder_level3.to('cuda:0')
         out_dec_level3 = self.decoder_level3(out_enc_level3)
-
+        del out_enc_level3
+        
+        # self.up3_2 = self.up3_2.to('cuda:0')
         inp_dec_level2 = self.up3_2(out_dec_level3)
+        del out_dec_level3
 
+        # self.fuse2 = self.fuse2.to('cuda:0')
         inp_dec_level2 = self.fuse2(inp_dec_level2, out_enc_level2)
+        
+        del out_enc_level2
+        torch.cuda.empty_cache()
+        print('1')
 
+        # self.decoder_level2 = self.decoder_level2.to('cuda:0')
         out_dec_level2 = self.decoder_level2(inp_dec_level2)
-
+        del inp_dec_level2
+        print('2')
+        
+        # self.up2_1 = self.up2_1.to('cuda:0')
         inp_dec_level1 = self.up2_1(out_dec_level2)
-
-        inp_dec_level1 = self.fuse1(inp_dec_level1, out_enc_level1)
+        del out_dec_level2
+        torch.cuda.empty_cache()
+        print('3')
+        # ===================================================================================
+        # self.fuse1 = self.fuse1.to('cuda:1')
+        inp_dec_level1 = self.fuse1(inp_dec_level1.to('cuda:1'), out_enc_level1.to('cuda:1'))
+        # inp_dec_level1 = self.fuse1(inp_dec_level1, out_enc_level1)
+        del out_enc_level1
+        torch.cuda.empty_cache()
+        print('4')
+        
+        # self.decoder_level1 = self.decoder_level1.to('cuda:1')
         out_dec_level1 = self.decoder_level1(inp_dec_level1)
-
+        del inp_dec_level1
+        torch.cuda.empty_cache()
+        
+        print('5')
+        # self.refinement = self.refinement.to('cuda:1')
         out_dec_level1 = self.refinement(out_dec_level1)
-
-        out_dec_level1 = self.output(out_dec_level1) + inp_img
+        print('6')
+        
+        # self.output = self.output.to('cuda:1')
+        out_dec_level1 = self.output(out_dec_level1) + inp_img.to('cuda:1')
+        print('7')
 
         return out_dec_level1
+
+# class fftformerSequential(fftformer):
+#     def to_layers(self):
+#         cat1 = Namespace()
+#         cat2 = Namespace()
+#         model = nn.Sequential(
+#                     self.patch_embed,
+#                     self.encoder_level1,
+#                     UpStash().isolate(cat1),
+#                     self.down1_2,
+#                     self.encoder_level2,
+#                     UpStash().isolate(cat2),
+#                     self.down2_3,
+#                     self.encoder_level3,
+#                     self.decoder_level3,
+#                     self.up3_2,
+#                     UpCat().isolate(cat2),
+#                     self.fuse2,
+#                     self.reduce_chan_level2,
+#                     self.decoder_level2,
+#                     self.up2_1,
+#                     UpCat().isolate(cat1),
+#                     self.fuse1,
+#                     self.decoder_level1,
+#                     self.refinement,
+#                     self.output,
+#                 )
+
+#         return model
+
+class fftformerSequential(fftformer):
+    def to_layers(self):
+        img = Namespace()
+        cat1 = Namespace()
+        cat2 = Namespace()
+        
+        model = nn.Sequential(OrderedDict([
+                    ("img", UpStash().isolate(img)),
+                    ("patch_embed", self.patch_embed),
+                    ("encoder_level1", self.encoder_level1),
+                    ("cat1", UpStash().isolate(cat1)),
+                    ("down1_2", self.down1_2),
+                    ("encoder_level2", self.encoder_level2),
+                    ("cat2", UpStash().isolate(cat2)),
+                    ("down2_3", self.down2_3),
+                    ("encoder_level3", self.encoder_level3),
+                    ("decoder_level3", self.decoder_level3),
+                    ("up3_2", self.up3_2),
+                    ("UpPop2", UpCat().isolate(cat2)),
+                    ("fuse2", self.fuse2),
+                    # ("reduce_chan_level2",self.reduce_chan_level2),
+                    ("decoder_level2", self.decoder_level2),
+                    ("up2_1", self.up2_1),
+                    ("UpPop1", UpCat().isolate(cat1)),
+                    ("fuse1", self.fuse1),
+                    ("decoder_level1", self.decoder_level1),
+                    ("refinement", self.refinement),
+                    ("output",self.output),
+                    ("Reg", UpCat(False).isolate(img)),
+                ]))
+
+        return model
+    # def forward(self, inp_img):
+
+    #     return self.model(inp_img)
+
+class fftformerpipe(fftformer):
+    def to_layers(self):
+        layers=[
+            self.patch_embed,
+            *self.encoder_level1,
+            self.down1_2,
+            *self.encoder_level2,
+            self.down2_3,
+            *self.encoder_level3,
+            *self.decoder_level3,
+            self.up3_2,
+            self.fuse2,
+            self.reduce_chan_level2,            
+            *self.decoder_level2,            
+            self.up2_1,
+            self.fuse1,        
+            *self.decoder_level1,            
+            *self.refinement,            
+            self.output,
+        ]
+
+        return layers
+
+
